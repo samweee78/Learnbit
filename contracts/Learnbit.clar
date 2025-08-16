@@ -15,6 +15,15 @@
 (define-constant err-group-goal-not-found (err u113))
 (define-constant err-goal-already-completed (err u114))
 (define-constant err-invalid-goal-hours (err u115))
+(define-constant err-resource-not-found (err u116))
+(define-constant err-invalid-price (err u117))
+(define-constant err-cannot-buy-own-resource (err u118))
+(define-constant err-resource-not-active (err u119))
+(define-constant err-invalid-rating (err u120))
+(define-constant err-already-rated (err u121))
+(define-constant err-not-resource-owner (err u122))
+(define-constant err-invalid-resource-data (err u123))
+(define-constant err-resource-already-purchased (err u124))
 
 (define-fungible-token learnbit)
 
@@ -77,12 +86,56 @@
     uint
 )
 
+(define-map study-resources
+    uint
+    {
+        title: (string-ascii 128),
+        description: (string-ascii 256),
+        subject: (string-ascii 64),
+        creator: principal,
+        price: uint,
+        creation-time: uint,
+        total-sales: uint,
+        total-ratings: uint,
+        rating-sum: uint,
+        active: bool
+    }
+)
+
+(define-map resource-purchases
+    {buyer: principal, resource-id: uint}
+    {
+        purchase-time: uint,
+        price-paid: uint
+    }
+)
+
+(define-map resource-ratings
+    {rater: principal, resource-id: uint}
+    {
+        rating: uint,
+        review-time: uint
+    }
+)
+
+(define-map creator-earnings
+    principal
+    {
+        total-earned: uint,
+        total-resources: uint,
+        average-rating: uint
+    }
+)
+
 (define-data-var reward-rate uint u10)
 (define-data-var minimum-study-time uint u30)
 (define-data-var cooldown-period uint u86400)
 (define-data-var max-group-size uint u20)
 (define-data-var group-bonus-multiplier uint u5)
 (define-data-var group-counter uint u0)
+(define-data-var resource-counter uint u0)
+(define-data-var platform-fee-percentage uint u5)
+(define-data-var min-resource-price uint u1)
 
 (define-public (register-student)
     (let ((student tx-sender))
@@ -434,3 +487,223 @@
 (define-read-only (get-total-groups)
     (ok (var-get group-counter))
 )
+
+(define-public (create-study-resource (title (string-ascii 128)) (description (string-ascii 256)) (subject (string-ascii 64)) (price uint))
+    (let (
+        (creator tx-sender)
+        (new-resource-id (+ (var-get resource-counter) u1))
+    )
+        (asserts! (is-some (map-get? students creator)) err-not-registered)
+        (asserts! (> (len title) u0) err-invalid-resource-data)
+        (asserts! (> (len description) u0) err-invalid-resource-data)
+        (asserts! (> (len subject) u0) err-invalid-resource-data)
+        (asserts! (>= price (var-get min-resource-price)) err-invalid-price)
+        
+        (map-set study-resources
+            new-resource-id
+            {
+                title: title,
+                description: description,
+                subject: subject,
+                creator: creator,
+                price: price,
+                creation-time: stacks-block-height,
+                total-sales: u0,
+                total-ratings: u0,
+                rating-sum: u0,
+                active: true
+            }
+        )
+        
+        (let ((current-earnings (default-to {total-earned: u0, total-resources: u0, average-rating: u0} (map-get? creator-earnings creator))))
+            (map-set creator-earnings
+                creator
+                (merge current-earnings {
+                    total-resources: (+ (get total-resources current-earnings) u1)
+                })
+            )
+        )
+        
+        (var-set resource-counter new-resource-id)
+        (ok new-resource-id)
+    )
+)
+
+(define-public (purchase-study-resource (resource-id uint))
+    (let (
+        (buyer tx-sender)
+        (resource-data (unwrap! (map-get? study-resources resource-id) err-resource-not-found))
+        (price (get price resource-data))
+        (creator (get creator resource-data))
+        (platform-fee (/ (* price (var-get platform-fee-percentage)) u100))
+        (creator-payment (- price platform-fee))
+    )
+        (asserts! (is-some (map-get? students buyer)) err-not-registered)
+        (asserts! (get active resource-data) err-resource-not-active)
+        (asserts! (not (is-eq buyer creator)) err-cannot-buy-own-resource)
+        (asserts! (is-none (map-get? resource-purchases {buyer: buyer, resource-id: resource-id})) err-resource-already-purchased)
+        (asserts! (>= (ft-get-balance learnbit buyer) price) err-insufficient-balance)
+        
+        (try! (transfer-tokens buyer creator creator-payment))
+        (try! (transfer-tokens buyer contract-owner platform-fee))
+        
+        (map-set resource-purchases
+            {buyer: buyer, resource-id: resource-id}
+            {
+                purchase-time: stacks-block-height,
+                price-paid: price
+            }
+        )
+        
+        (map-set study-resources
+            resource-id
+            (merge resource-data {
+                total-sales: (+ (get total-sales resource-data) u1)
+            })
+        )
+        
+        (let ((current-creator-earnings (default-to {total-earned: u0, total-resources: u0, average-rating: u0} (map-get? creator-earnings creator))))
+            (map-set creator-earnings
+                creator
+                (merge current-creator-earnings {
+                    total-earned: (+ (get total-earned current-creator-earnings) creator-payment)
+                })
+            )
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (rate-study-resource (resource-id uint) (rating uint))
+    (let (
+        (rater tx-sender)
+        (resource-data (unwrap! (map-get? study-resources resource-id) err-resource-not-found))
+    )
+        (asserts! (is-some (map-get? students rater)) err-not-registered)
+        (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+        (asserts! (is-some (map-get? resource-purchases {buyer: rater, resource-id: resource-id})) err-resource-not-found)
+        (asserts! (is-none (map-get? resource-ratings {rater: rater, resource-id: resource-id})) err-already-rated)
+        
+        (map-set resource-ratings
+            {rater: rater, resource-id: resource-id}
+            {
+                rating: rating,
+                review-time: stacks-block-height
+            }
+        )
+        
+        (let (
+            (new-total-ratings (+ (get total-ratings resource-data) u1))
+            (new-rating-sum (+ (get rating-sum resource-data) rating))
+            (new-average-rating (/ new-rating-sum new-total-ratings))
+        )
+            (map-set study-resources
+                resource-id
+                (merge resource-data {
+                    total-ratings: new-total-ratings,
+                    rating-sum: new-rating-sum
+                })
+            )
+            
+            (let ((creator-data (default-to {total-earned: u0, total-resources: u0, average-rating: u0} (map-get? creator-earnings (get creator resource-data)))))
+                (map-set creator-earnings
+                    (get creator resource-data)
+                    (merge creator-data {
+                        average-rating: new-average-rating
+                    })
+                )
+            )
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (deactivate-study-resource (resource-id uint))
+    (let (
+        (caller tx-sender)
+        (resource-data (unwrap! (map-get? study-resources resource-id) err-resource-not-found))
+    )
+        (asserts! (is-eq caller (get creator resource-data)) err-not-resource-owner)
+        (asserts! (get active resource-data) err-resource-not-active)
+        
+        (map-set study-resources
+            resource-id
+            (merge resource-data {
+                active: false
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (update-resource-price (resource-id uint) (new-price uint))
+    (let (
+        (caller tx-sender)
+        (resource-data (unwrap! (map-get? study-resources resource-id) err-resource-not-found))
+    )
+        (asserts! (is-eq caller (get creator resource-data)) err-not-resource-owner)
+        (asserts! (get active resource-data) err-resource-not-active)
+        (asserts! (>= new-price (var-get min-resource-price)) err-invalid-price)
+        
+        (map-set study-resources
+            resource-id
+            (merge resource-data {
+                price: new-price
+            })
+        )
+        
+        (ok true)
+    )
+)
+
+(define-public (search-resources-by-subject (subject (string-ascii 64)))
+    (ok (var-get resource-counter))
+)
+
+(define-read-only (get-resource-info (resource-id uint))
+    (ok (map-get? study-resources resource-id))
+)
+
+(define-read-only (get-resource-purchase (buyer principal) (resource-id uint))
+    (ok (map-get? resource-purchases {buyer: buyer, resource-id: resource-id}))
+)
+
+(define-read-only (get-resource-rating (rater principal) (resource-id uint))
+    (ok (map-get? resource-ratings {rater: rater, resource-id: resource-id}))
+)
+
+(define-read-only (get-creator-earnings (creator principal))
+    (ok (map-get? creator-earnings creator))
+)
+
+(define-read-only (get-resource-average-rating (resource-id uint))
+    (let ((resource-data (map-get? study-resources resource-id)))
+        (match resource-data
+            resource-info (if (> (get total-ratings resource-info) u0)
+                (ok (some (/ (get rating-sum resource-info) (get total-ratings resource-info))))
+                (ok none)
+            )
+            (ok none)
+        )
+    )
+)
+
+(define-read-only (has-purchased-resource (buyer principal) (resource-id uint))
+    (ok (is-some (map-get? resource-purchases {buyer: buyer, resource-id: resource-id})))
+)
+
+(define-read-only (get-total-resources)
+    (ok (var-get resource-counter))
+)
+
+(define-read-only (get-platform-stats)
+    (ok {
+        total-resources: (var-get resource-counter),
+        platform-fee: (var-get platform-fee-percentage),
+        min-price: (var-get min-resource-price)
+    })
+)
+
